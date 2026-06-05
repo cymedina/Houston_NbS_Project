@@ -1,0 +1,1485 @@
+---
+title: "GitHub"
+author: "Clara Medina"
+date: "2026-06-05"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(brms)
+library(posterior)
+library(bayesplot)
+library(marginaleffects)
+library(openxlsx)
+library(tigris)
+library(sf)
+library(patchwork)
+library(cowplot)
+library(readr)
+
+# Seting options
+options(contrasts = c("contr.treatment", "contr.treatment"))
+options(tigris_use_cache = TRUE)
+
+url <- "https://github.com/cymedina/Houston_NbS_Project/blob/main/Localized_HTX.csv"
+cleandata <- read_csv(url)
+
+url2 <- "https://github.com/cymedina/Houston_NbS_Project/blob/main/Qualtrics_Broad_HTX.csv"
+clean_broaddata <- read_csv(url2)
+```
+
+## Cleaning & collapsing data
+
+```{r}
+# Localized Data: Northeast Houston & Baytown, TX
+
+# Collapse education variable
+cleandata <- cleandata %>%
+  mutate(
+    Q32_Ordered = case_when(
+      Q32_Ordered == "HS or less" ~ 0,
+      Q32_Ordered %in% c("Some college/Assoc", "Bachelor+") ~ 1,
+      Q32_Ordered == "No response" ~ NA_real_
+    )
+  )
+
+# Set reference levels
+cleandata <- cleandata %>%
+  mutate(
+    Q34 = relevel(factor(Q34), ref = "I own my home."),
+    Q31_Ordered = factor(Q31_Ordered, 
+                        levels = c("Up to 5 years", "6-10 years", 
+                                  "11-20 years", "Over 20 years"),
+                        ordered = FALSE),
+    Q33_Ordered = factor(Q33_Ordered,
+                        levels = c("Low (<50k)", "Moderate (50k-<150k)", 
+                                  "High (≥150k)"),
+                        ordered = FALSE)
+  )
+
+# Convert flood frequency and trust to numeric (1-5)
+cleandata <- cleandata %>%
+  mutate(
+    Flood_Numeric = as.numeric(Q6_Ordered),
+    Trust_Numeric = as.numeric(Q17)
+  )
+
+# Convert outcomes to binary
+cleandata <- cleandata %>%
+  mutate(
+    Prefers_small_GSI = ifelse(Prefers_small_GSI == "TRUE", 1, 0),
+    Prefers_mid_GSI = ifelse(Prefers_mid_GSI == "TRUE", 1, 0),
+    Prefers_large_GSI = ifelse(Prefers_large_GSI == "TRUE", 1, 0)
+  )
+
+# Create complete-case dataset
+cleandata_complete <- cleandata %>%
+  filter(complete.cases(Prefers_small_GSI, Prefers_mid_GSI, Prefers_large_GSI,
+                        Flood_Numeric, Trust_Numeric, Q29, 
+                        Q31_Ordered, Q33_Ordered, Q34))
+
+cat("Localized sample complete cases:", nrow(cleandata_complete), "\n")
+
+# Citywide Data: Houston and Baytown, TX
+
+# Select relevant columns
+clean_broaddata <- clean_broaddata %>%
+  dplyr::select(Q29, Q31, Q32, Q33, Q34, Q6, Q9, 
+                Q16, Q35_City, Q35_Zip, Q17, Q27, 
+                Q13_small, Q131_mid, Q13_large, Generated_ParticipantID)
+
+# Process flood frequency
+clean_broaddata <- clean_broaddata %>%
+  mutate(
+    Flood_Numeric = case_when(
+      Q6 == "Never" ~ 1,
+      Q6 == "Rarely – (once a year or less)" ~ 2,
+      Q6 == "Sometimes – (once every 2-6 months)" ~ 3,
+      Q6 == "Often – (At least once a month)" ~ 4,
+      Q6 == "Always – (every time it rains)" ~ 5
+    )
+  ) %>%
+  dplyr::select(-Q6)
+
+# Process trust
+clean_broaddata <- clean_broaddata %>%
+  mutate(
+    Trust_Numeric = case_when(
+      Q17 == "No trust" ~ 1,
+      Q17 == "Slight trust" ~ 2,
+      Q17 == "Moderate trust" ~ 3,
+      Q17 == "Above average trust" ~ 4,
+      Q17 == "Extreme trust" ~ 5
+    )
+  ) %>%
+  dplyr::select(-Q17)
+
+# Process GSI preferences
+process_gsi <- function(data, col_name, gsi_options, scale_name) {
+  data <- data %>%
+    mutate(!!col_name := replace_na(.data[[col_name]], "No response"))
+  
+  dummies <- data %>%
+    mutate(split_col = strsplit(as.character(.data[[col_name]]), ",")) %>%
+    unnest(split_col) %>%
+    mutate(split_col = trimws(split_col), value = 1) %>%
+    pivot_wider(
+      id_cols = Generated_ParticipantID,
+      names_from = split_col,
+      values_from = value,
+      values_fill = list(value = 0),
+      names_prefix = paste0("Q13_", scale_name, "_")
+    )
+  
+  data <- data %>%
+    left_join(dummies, by = "Generated_ParticipantID")
+  
+  pref_cols <- paste0("Q13_", scale_name, "_", gsi_options)
+  no_pref_col <- paste0("Q13_", scale_name, "_I prefer not to implement ", 
+                        scale_name, "-scale GSI in my community")
+  prefer_col <- paste0("Prefers_", scale_name, "_GSI")
+  
+  data <- data %>%
+    mutate(
+      !!prefer_col := case_when(
+        .data[[no_pref_col]] == 1 ~ 0,
+        if_any(all_of(pref_cols), ~ .x == 1) ~ 1,
+        TRUE ~ 0
+      )
+    ) %>%
+    dplyr::select(-starts_with(paste0("Q13_", scale_name, "_")))
+  
+  return(data)
+}
+
+clean_broaddata <- clean_broaddata %>%
+  process_gsi(
+    "Q13_small",
+    c("Permeable pavement", "Rain garden", "Rainwater harvesting", "Bioswale"),
+    "small"
+  ) %>%
+  process_gsi(
+    "Q131_mid",
+    c("Nature-based detention pond", "Pocket prairie", "Pocket wetland", "Urban forestry"),
+    "mid"
+  ) %>%
+  process_gsi(
+    "Q13_large",
+    c("Large park", "Wetland conservation", "Wetland restoration (inland or coastal)"),
+    "large"
+  )
+
+# Process demographics
+clean_broaddata <- clean_broaddata %>%
+  mutate(
+    Q31_Ordered = factor(
+      case_when(
+        Q31 %in% c("Less than a year", "1-5 years") ~ "Up to 5 years",
+        Q31 == "6-10 years" ~ "6-10 years",
+        Q31 == "11-20 years" ~ "11-20 years",
+        Q31 == "Over 20 years" ~ "Over 20 years",
+        TRUE ~ NA_character_
+      ),
+      levels = c("Up to 5 years", "6-10 years", "11-20 years", "Over 20 years"),
+      ordered = FALSE
+    ),
+    Q32_Ordered = case_when(
+      str_detect(Q32, "Less than a high school|High school diploma") ~ 0,
+      str_detect(Q32, "Some college|Associate|Bachelor|Master|Professional|Doctorate") ~ 1,
+      TRUE ~ NA_real_
+    ),
+    Q33_Ordered = factor(
+      case_when(
+        Q33 %in% c("Less than \$10,000", "\$10,000 to \$14,999", "\$15,000 to \$24,999", 
+                   "\$25,000 to \$34,999", "\$35,000 to \$49,999") ~ "Low (<50k)",
+        Q33 %in% c("\$50,000 to \$74,999", "\$75,000 to \$99,999", 
+                   "\$100,00 to \$149,999") ~ "Moderate (50k-<150k)",
+        Q33 %in% c("\$150,000 to \$199,999", "\$200,000 or more") ~ "High (≥150k)",
+        TRUE ~ NA_character_
+      ),
+      levels = c("Low (<50k)", "Moderate (50k-<150k)", "High (≥150k)"),
+      ordered = FALSE
+    ),
+    Q34 = relevel(factor(Q34), ref = "I own my home.")
+  )
+
+# Create complete-case dataset
+clean_broaddata_complete <- clean_broaddata %>%
+  filter(complete.cases(Prefers_small_GSI, Prefers_mid_GSI, Prefers_large_GSI,
+                        Flood_Numeric, Trust_Numeric, Q29, 
+                        Q31_Ordered, Q33_Ordered, Q34))
+
+cat("Citywide sample complete cases:", nrow(clean_broaddata_complete), "\n")
+```
+
+## Variable Selection and Diagnostics
+
+```{r bivariate-associations}
+library(vcd)      # for Cramér's V
+library(MASS)     # for contingency tables
+
+# Function to compute associations for binary outcomes
+compute_associations <- function(outcome, predictors_df, data, alpha = 0.05) {
+  results <- list()
+  
+  for (var in names(predictors_df)) {
+    x <- predictors_df[[var]]
+    y <- data[[outcome]]
+    
+    # Remove missing values
+    complete_cases <- complete.cases(x, y)
+    x_complete <- x[complete_cases]
+    y_complete <- y[complete_cases]
+    n_complete <- sum(complete_cases)
+    n_missing <- sum(!complete_cases)
+    
+    if (is.numeric(x)) {
+      # Numeric: logistic regression for OR
+      fit <- glm(y_complete ~ x_complete, family = binomial)
+      coef_summary <- summary(fit)$coefficients[2, ]
+      confint_vals <- confint(fit)[2, ]
+      
+      results[[var]] <- tibble(
+        predictor = var,
+        type = "numeric",
+        n_complete = n_complete,
+        n_missing = n_missing,
+        OR = exp(coef_summary[1]),
+        OR_lower = exp(confint_vals[1]),
+        OR_upper = exp(confint_vals[2]),
+        pvalue = coef_summary[4],
+        significant = pvalue < alpha
+      )
+      
+    } else if (is.ordered(x)) {
+      # Ordered factor: Kendall's tau
+      tau_test <- cor.test(as.numeric(x_complete), y_complete, 
+                          method = "kendall", exact = FALSE)
+      
+      results[[var]] <- tibble(
+        predictor = var,
+        type = "ordered",
+        n_complete = n_complete,
+        n_missing = n_missing,
+        Kendall_tau = tau_test$estimate,
+        pvalue = tau_test$p.value,
+        significant = pvalue < alpha
+      )
+      
+    } else if (is.factor(x) && nlevels(x) > 1) {
+      # Categorical: Chi-square/Fisher's exact + Cramér's V
+      tbl <- table(x_complete, y_complete)
+      
+      # Choose test based on expected frequencies
+      expected <- chisq.test(tbl)$expected
+      use_fisher <- any(expected < 5)
+      
+      if (use_fisher) {
+        test_result <- fisher.test(tbl, simulate.p.value = TRUE)
+        test_name <- "Fisher"
+      } else {
+        test_result <- chisq.test(tbl)
+        test_name <- "Chi-square"
+      }
+      
+      # Calculate Cramér's V
+      cramers_v <- assocstats(tbl)$cramer
+      
+      # Interpret effect size (fixed thresholds)
+      effect_size <- case_when(
+        cramers_v < 0.1 ~ "Negligible",
+        cramers_v < 0.3 ~ "Weak",
+        cramers_v < 0.5 ~ "Moderate",
+        cramers_v < 0.7 ~ "Strong",
+        TRUE ~ "Very Strong"
+      )
+      
+      results[[var]] <- tibble(
+        predictor = var,
+        type = "factor",
+        test_used = test_name,
+        n_complete = n_complete,
+        n_missing = n_missing,
+        CramersV = cramers_v,
+        effect_size = effect_size,
+        pvalue = test_result$p.value,
+        significant = pvalue < alpha
+      )
+    }
+  }
+  
+  bind_rows(results)
+}
+
+# Select candidate predictors (exclude outcomes)
+gsi_outcomes <- c("Prefers_small_GSI", "Prefers_mid_GSI", "Prefers_large_GSI")
+
+predictors_local <- cleandata_complete %>%
+  dplyr::select(-all_of(gsi_outcomes)) %>%
+  dplyr::select_if(~ !all(is.na(.)))
+
+predictors_city <- clean_broaddata_complete %>%
+  dplyr::select(-all_of(gsi_outcomes)) %>%
+  dplyr::select_if(~ !all(is.na(.)))
+
+# Run associations for all outcomes - LOCALIZED
+cat("=== Bivariate Associations: Localized Sample ===\n\n")
+
+assoc_local_small <- compute_associations("Prefers_small_GSI", 
+                                          predictors_local, 
+                                          cleandata_complete)
+assoc_local_mid <- compute_associations("Prefers_mid_GSI", 
+                                        predictors_local, 
+                                        cleandata_complete)
+assoc_local_large <- compute_associations("Prefers_large_GSI", 
+                                          predictors_local, 
+                                          cleandata_complete)
+
+# Run associations for all outcomes - CITYWIDE
+cat("=== Bivariate Associations: Citywide Sample ===\n\n")
+
+assoc_city_small <- compute_associations("Prefers_small_GSI", 
+                                         predictors_city, 
+                                         clean_broaddata_complete)
+assoc_city_mid <- compute_associations("Prefers_mid_GSI", 
+                                       predictors_city, 
+                                       clean_broaddata_complete)
+assoc_city_large <- compute_associations("Prefers_large_GSI", 
+                                         predictors_city, 
+                                         clean_broaddata_complete)
+
+# Summary of significant associations
+cat("\nSignificant associations (p < 0.05) - Localized:\n")
+cat("Small GSI:", sum(assoc_local_small$significant, na.rm = TRUE), "of", 
+    nrow(assoc_local_small), "\n")
+cat("Mid GSI:", sum(assoc_local_mid$significant, na.rm = TRUE), "of", 
+    nrow(assoc_local_mid), "\n")
+cat("Large GSI:", sum(assoc_local_large$significant, na.rm = TRUE), "of", 
+    nrow(assoc_local_large), "\n")
+
+cat("\nSignificant associations (p < 0.05) - Citywide:\n")
+cat("Small GSI:", sum(assoc_city_small$significant, na.rm = TRUE), "of", 
+    nrow(assoc_city_small), "\n")
+cat("Mid GSI:", sum(assoc_city_mid$significant, na.rm = TRUE), "of", 
+    nrow(assoc_city_mid), "\n")
+cat("Large GSI:", sum(assoc_city_large$significant, na.rm = TRUE), "of", 
+    nrow(assoc_city_large), "\n")
+
+### Contingency Diagnostics
+
+# Function to check contingency table dimensions
+check_contingency_tables <- function(data, outcome_var, predictor_vars, 
+                                    min_dimension = 5) {
+  
+  results <- list()
+  
+  for (pred in predictor_vars) {
+    if (is.factor(data[[pred]]) || is.character(data[[pred]])) {
+      
+      # Create contingency table
+      tbl <- table(data[[pred]], data[[outcome_var]], useNA = "ifany")
+      
+      # Get dimensions
+      n_rows <- nrow(tbl)
+      n_cols <- ncol(tbl)
+      
+      # Check if meets threshold
+      meets_threshold <- (n_rows >= min_dimension) & (n_cols >= min_dimension)
+      
+      # Count sparse cells (< 5 observations)
+      sparse_cells <- sum(tbl < 5)
+      total_cells <- length(tbl)
+      prop_sparse <- sparse_cells / total_cells
+      
+      results[[pred]] <- tibble(
+        predictor = pred,
+        outcome = outcome_var,
+        n_rows = n_rows,
+        n_cols = n_cols,
+        total_n = sum(tbl),
+        sparse_cells = sparse_cells,
+        total_cells = total_cells,
+        prop_sparse = round(prop_sparse, 3),
+        meets_threshold = meets_threshold,
+        interpretation = case_when(
+          !meets_threshold ~ "Below 5x5 threshold",
+          prop_sparse > 0.2 ~ "Many sparse cells (>20%)",
+          prop_sparse > 0 ~ "Some sparse cells",
+          TRUE ~ "Adequate cell counts"
+        )
+      )
+    }
+  }
+  
+  bind_rows(results)
+}
+
+# Get categorical predictors
+categorical_vars_local <- predictors_local %>%
+  dplyr::select(where(is.factor)) %>%
+  names()
+
+categorical_vars_city <- predictors_city %>%
+  dplyr::select(where(is.factor)) %>%
+  names()
+
+# Check contingency tables - LOCALIZED
+cat("=== Contingency Diagnostics: Localized Sample ===\n\n")
+
+contingency_local_small <- check_contingency_tables(
+  cleandata_complete, "Prefers_small_GSI", categorical_vars_local
+)
+contingency_local_mid <- check_contingency_tables(
+  cleandata_complete, "Prefers_mid_GSI", categorical_vars_local
+)
+contingency_local_large <- check_contingency_tables(
+  cleandata_complete, "Prefers_large_GSI", categorical_vars_local
+)
+
+contingency_local <- bind_rows(
+  contingency_local_small,
+  contingency_local_mid,
+  contingency_local_large
+)
+
+# Identify problematic variables
+problematic_local <- contingency_local %>%
+  filter(!meets_threshold | prop_sparse > 0.2) %>%
+  distinct(predictor) %>%
+  pull(predictor)
+
+cat("Predictors with contingency issues (localized):\n")
+print(problematic_local)
+
+# Check contingency tables - CITYWIDE
+cat("\n=== Contingency Diagnostics: Citywide Sample ===\n\n")
+
+contingency_city_small <- check_contingency_tables(
+  clean_broaddata_complete, "Prefers_small_GSI", categorical_vars_city
+)
+contingency_city_mid <- check_contingency_tables(
+  clean_broaddata_complete, "Prefers_mid_GSI", categorical_vars_city
+)
+contingency_city_large <- check_contingency_tables(
+  clean_broaddata_complete, "Prefers_large_GSI", categorical_vars_city
+)
+
+contingency_city <- bind_rows(
+  contingency_city_small,
+  contingency_city_mid,
+  contingency_city_large
+)
+
+# Identify problematic variables
+problematic_city <- contingency_city %>%
+  filter(!meets_threshold | prop_sparse > 0.2) %>%
+  distinct(predictor) %>%
+  pull(predictor)
+
+cat("Predictors with contingency issues (citywide):\n")
+print(problematic_city)
+```
+
+```{r}
+library(corrplot)
+
+# Function to test collinearity
+test_collinearity <- function(data, vars, threshold = 0.7) {
+  
+  # Convert factors to numeric for correlation
+  data_numeric <- data %>%
+    dplyr::select(all_of(vars)) %>%
+    mutate(across(where(is.factor), as.numeric)) %>%
+    mutate(across(where(is.ordered), as.numeric))
+  
+  # Calculate correlation matrix
+  cor_matrix <- cor(data_numeric, use = "pairwise.complete.obs")
+  
+  # Find high correlations
+  high_cor <- which(abs(cor_matrix) > threshold & 
+                   abs(cor_matrix) < 1, arr.ind = TRUE)
+  
+  if (nrow(high_cor) > 0) {
+    collinear_pairs <- data.frame(
+      var1 = rownames(cor_matrix)[high_cor[,1]],
+      var2 = colnames(cor_matrix)[high_cor[,2]],
+      correlation = cor_matrix[high_cor],
+      abs_correlation = abs(cor_matrix[high_cor])
+    ) %>%
+      filter(var1 < var2) %>%  # Remove duplicates
+      arrange(desc(abs_correlation))
+    
+    return(list(
+      correlation_matrix = cor_matrix,
+      collinear_pairs = collinear_pairs
+    ))
+  } else {
+    return(list(
+      correlation_matrix = cor_matrix,
+      collinear_pairs = NULL
+    ))
+  }
+}
+
+# Test collinearity - LOCALIZED
+cat("=== Collinearity Testing: Localized Sample ===\n\n")
+
+# Get all predictors (numeric and converted factors)
+predictor_vars_local <- c("Flood_Numeric", "Trust_Numeric", "Q29", 
+                          "Q31_Ordered", "Q33_Ordered", "Q34")
+
+collinearity_local <- test_collinearity(
+  cleandata_complete, 
+  predictor_vars_local,
+  threshold = 0.7
+)
+
+if (!is.null(collinearity_local$collinear_pairs)) {
+  cat("Collinear variable pairs (|r| > 0.7):\n")
+  print(collinearity_local$collinear_pairs)
+} else {
+  cat("✓ No collinear pairs found (|r| > 0.7)\n")
+}
+
+# Visualize correlation matrix
+corrplot(collinearity_local$correlation_matrix, 
+         method = "color", 
+         type = "upper",
+         tl.col = "black", 
+         tl.srt = 45,
+         title = "Localized Sample: Predictor Correlations",
+         mar = c(0,0,2,0))
+
+# Test collinearity - CITYWIDE
+cat("\n=== Collinearity Testing: Citywide Sample ===\n\n")
+
+predictor_vars_city <- c("Flood_Numeric", "Trust_Numeric", "Q29", 
+                         "Q31_Ordered", "Q33_Ordered", "Q34")
+
+collinearity_city <- test_collinearity(
+  clean_broaddata_complete, 
+  predictor_vars_city,
+  threshold = 0.7
+)
+
+if (!is.null(collinearity_city$collinear_pairs)) {
+  cat("Collinear variable pairs (|r| > 0.7):\n")
+  print(collinearity_city$collinear_pairs)
+} else {
+  cat("✓ No collinear pairs found (|r| > 0.7)\n")
+}
+
+# Visualize correlation matrix
+corrplot(collinearity_city$correlation_matrix, 
+         method = "color", 
+         type = "upper",
+         tl.col = "black", 
+         tl.srt = 45,
+         title = "Citywide Sample: Predictor Correlations",
+         mar = c(0,0,2,0))
+```
+
+```{r}
+### 2.3.4 Export Diagnostic Results
+
+```{r export-diagnostics}
+# Create Excel workbook with all diagnostics
+wb <- createWorkbook()
+
+# ============================================================================
+# BIVARIATE ASSOCIATIONS
+# ============================================================================
+
+# Localized Sample
+addWorksheet(wb, "Assoc_Local_Small")
+writeData(wb, "Assoc_Local_Small", assoc_local_small, startRow = 2)
+writeData(wb, "Assoc_Local_Small", 
+          "Bivariate Associations: Localized Sample - Small GSI", 
+          startRow = 1, startCol = 1)
+
+addWorksheet(wb, "Assoc_Local_Mid")
+writeData(wb, "Assoc_Local_Mid", assoc_local_mid, startRow = 2)
+writeData(wb, "Assoc_Local_Mid", 
+          "Bivariate Associations: Localized Sample - Mid GSI", 
+          startRow = 1, startCol = 1)
+
+addWorksheet(wb, "Assoc_Local_Large")
+writeData(wb, "Assoc_Local_Large", assoc_local_large, startRow = 2)
+writeData(wb, "Assoc_Local_Large", 
+          "Bivariate Associations: Localized Sample - Large GSI", 
+          startRow = 1, startCol = 1)
+
+# Citywide Sample
+addWorksheet(wb, "Assoc_City_Small")
+writeData(wb, "Assoc_City_Small", assoc_city_small, startRow = 2)
+writeData(wb, "Assoc_City_Small", 
+          "Bivariate Associations: Citywide Sample - Small GSI", 
+          startRow = 1, startCol = 1)
+
+addWorksheet(wb, "Assoc_City_Mid")
+writeData(wb, "Assoc_City_Mid", assoc_city_mid, startRow = 2)
+writeData(wb, "Assoc_City_Mid", 
+          "Bivariate Associations: Citywide Sample - Mid GSI", 
+          startRow = 1, startCol = 1)
+
+addWorksheet(wb, "Assoc_City_Large")
+writeData(wb, "Assoc_City_Large", assoc_city_large, startRow = 2)
+writeData(wb, "Assoc_City_Large", 
+          "Bivariate Associations: Citywide Sample - Large GSI", 
+          startRow = 1, startCol = 1)
+
+# ============================================================================
+# CONTINGENCY DIAGNOSTICS
+# ============================================================================
+
+addWorksheet(wb, "Contingency_Local")
+writeData(wb, "Contingency_Local", contingency_local, startRow = 2)
+writeData(wb, "Contingency_Local", 
+          "Contingency Table Diagnostics: Localized Sample (All Outcomes)", 
+          startRow = 1, startCol = 1)
+
+addWorksheet(wb, "Contingency_City")
+writeData(wb, "Contingency_City", contingency_city, startRow = 2)
+writeData(wb, "Contingency_City", 
+          "Contingency Table Diagnostics: Citywide Sample (All Outcomes)", 
+          startRow = 1, startCol = 1)
+
+# ============================================================================
+# COLLINEARITY RESULTS
+# ============================================================================
+
+# Localized collinearity
+addWorksheet(wb, "Collinearity_Local")
+
+if (!is.null(collinearity_local$collinear_pairs)) {
+  writeData(wb, "Collinearity_Local", 
+            collinearity_local$collinear_pairs, startRow = 3)
+  writeData(wb, "Collinearity_Local", 
+            "Collinear Variable Pairs: Localized Sample (|r| > 0.7)", 
+            startRow = 1, startCol = 1)
+  writeData(wb, "Collinearity_Local", 
+            paste("Found", nrow(collinearity_local$collinear_pairs), 
+                  "collinear pairs"), 
+            startRow = 2, startCol = 1)
+} else {
+  writeData(wb, "Collinearity_Local", 
+            "No Collinear Pairs Found: Localized Sample", 
+            startRow = 1, startCol = 1)
+  writeData(wb, "Collinearity_Local", 
+            "No variable pairs with |r| > 0.7", 
+            startRow = 2, startCol = 1)
+}
+
+# Correlation matrix - Localized
+cor_matrix_local_df <- as.data.frame(collinearity_local$correlation_matrix)
+cor_matrix_local_df$Variable <- rownames(cor_matrix_local_df)
+cor_matrix_local_df <- cor_matrix_local_df %>%
+  dplyr::select(Variable, everything())
+
+writeData(wb, "Collinearity_Local", cor_matrix_local_df, 
+          startRow = ifelse(!is.null(collinearity_local$collinear_pairs), 
+                           nrow(collinearity_local$collinear_pairs) + 6, 5), 
+          startCol = 1)
+
+# Citywide collinearity
+addWorksheet(wb, "Collinearity_City")
+
+if (!is.null(collinearity_city$collinear_pairs)) {
+  writeData(wb, "Collinearity_City", 
+            collinearity_city$collinear_pairs, startRow = 3)
+  writeData(wb, "Collinearity_City", 
+            "Collinear Variable Pairs: Citywide Sample (|r| > 0.7)", 
+            startRow = 1, startCol = 1)
+  writeData(wb, "Collinearity_City", 
+            paste("Found", nrow(collinearity_city$collinear_pairs), 
+                  "collinear pairs"), 
+            startRow = 2, startCol = 1)
+} else {
+  writeData(wb, "Collinearity_City", 
+            "No Collinear Pairs Found: Citywide Sample", 
+            startRow = 1, startCol = 1)
+  writeData(wb, "Collinearity_City", 
+            "No variable pairs with |r| > 0.7", 
+            startRow = 2, startCol = 1)
+}
+
+# Correlation matrix - Citywide
+cor_matrix_city_df <- as.data.frame(collinearity_city$correlation_matrix)
+cor_matrix_city_df$Variable <- rownames(cor_matrix_city_df)
+cor_matrix_city_df <- cor_matrix_city_df %>%
+  dplyr::select(Variable, everything())
+
+writeData(wb, "Collinearity_City", cor_matrix_city_df, 
+          startRow = ifelse(!is.null(collinearity_city$collinear_pairs), 
+                           nrow(collinearity_city$collinear_pairs) + 6, 5), 
+          startCol = 1)
+
+# ============================================================================
+# SUMMARY SHEET
+# ============================================================================
+
+addWorksheet(wb, "Summary")
+
+summary_stats <- data.frame(
+  Metric = c(
+    "=== LOCALIZED SAMPLE ===",
+    "Total complete observations",
+    "Predictors tested",
+    "Significant associations (Small GSI)",
+    "Significant associations (Mid GSI)",
+    "Significant associations (Large GSI)",
+    "Predictors with contingency issues",
+    "Collinear pairs (|r| > 0.7)",
+    "",
+    "=== CITYWIDE SAMPLE ===",
+    "Total complete observations",
+    "Predictors tested",
+    "Significant associations (Small GSI)",
+    "Significant associations (Mid GSI)",
+    "Significant associations (Large GSI)",
+    "Predictors with contingency issues",
+    "Collinear pairs (|r| > 0.7)",
+    "",
+    "=== EFFECT SIZE INTERPRETATION ===",
+    "Cramér's V < 0.1",
+    "0.1 ≤ Cramér's V < 0.3",
+    "0.3 ≤ Cramér's V < 0.5",
+    "0.5 ≤ Cramér's V < 0.7",
+    "Cramér's V ≥ 0.7",
+    "",
+    "=== CONTINGENCY THRESHOLDS ===",
+    "Minimum table dimension",
+    "Maximum sparse cells (%)",
+    "Sparse cell definition"
+  ),
+  Value = c(
+    "",
+    nrow(cleandata_complete),
+    nrow(assoc_local_small),
+    sum(assoc_local_small$significant, na.rm = TRUE),
+    sum(assoc_local_mid$significant, na.rm = TRUE),
+    sum(assoc_local_large$significant, na.rm = TRUE),
+    length(problematic_local),
+    ifelse(!is.null(collinearity_local$collinear_pairs), 
+           nrow(collinearity_local$collinear_pairs), 0),
+    "",
+    "",
+    nrow(clean_broaddata_complete),
+    nrow(assoc_city_small),
+    sum(assoc_city_small$significant, na.rm = TRUE),
+    sum(assoc_city_mid$significant, na.rm = TRUE),
+    sum(assoc_city_large$significant, na.rm = TRUE),
+    length(problematic_city),
+    ifelse(!is.null(collinearity_city$collinear_pairs), 
+           nrow(collinearity_city$collinear_pairs), 0),
+    "",
+    "",
+    "Negligible",
+    "Weak",
+    "Moderate",
+    "Strong",
+    "Very Strong",
+    "",
+    "",
+    "5 x 5",
+    "20%",
+    "< 5 observations"
+  )
+)
+
+writeData(wb, "Summary", summary_stats, startRow = 2)
+writeData(wb, "Summary", 
+          "Diagnostic Summary: Variable Selection & Association Testing", 
+          startRow = 1, startCol = 1)
+
+# ============================================================================
+# APPLY STYLING
+# ============================================================================
+
+title_style <- createStyle(fontSize = 12, textDecoration = "bold")
+header_style <- createStyle(fontSize = 11, textDecoration = "bold", 
+                           fgFill = "#D3D3D3", halign = "center")
+
+all_sheets <- c("Assoc_Local_Small", "Assoc_Local_Mid", "Assoc_Local_Large",
+                "Assoc_City_Small", "Assoc_City_Mid", "Assoc_City_Large",
+                "Contingency_Local", "Contingency_City",
+                "Collinearity_Local", "Collinearity_City",
+                "Summary")
+
+for(sheet in all_sheets) {
+  addStyle(wb, sheet, title_style, rows = 1, cols = 1)
+  addStyle(wb, sheet, header_style, rows = 2, cols = 1:20, gridExpand = TRUE)
+  setColWidths(wb, sheet, cols = 1:20, widths = "auto")
+}
+
+# ============================================================================
+# SAVE WORKBOOK
+# ============================================================================
+
+saveWorkbook(wb, "SI_Table_2_Variable_Selection_Diagnostics.xlsx", 
+             overwrite = TRUE)
+
+cat("\n✓ Diagnostic results exported to: SI_Table_2_Variable_Selection_Diagnostics.xlsx\n")
+cat("  Contains 11 sheets:\n")
+cat("  - 6 bivariate association sheets (3 outcomes × 2 samples)\n")
+cat("  - 2 contingency diagnostic sheets\n")
+cat("  - 2 collinearity sheets\n")
+cat("  - 1 summary sheet\n\n")
+
+# ============================================================================
+# PRINT KEY FINDINGS
+# ============================================================================
+
+cat("=== KEY DIAGNOSTIC FINDINGS ===\n\n")
+
+cat("LOCALIZED SAMPLE:\n")
+cat("  • Complete observations:", nrow(cleandata_complete), "\n")
+cat("  • Significant predictors of Small GSI:", 
+    sum(assoc_local_small$significant, na.rm = TRUE), "\n")
+cat("  • Significant predictors of Mid GSI:", 
+    sum(assoc_local_mid$significant, na.rm = TRUE), "\n")
+cat("  • Significant predictors of Large GSI:", 
+    sum(assoc_local_large$significant, na.rm = TRUE), "\n")
+cat("  • Variables with contingency issues:", 
+    length(problematic_local), "\n")
+if (length(problematic_local) > 0) {
+  cat("    -", paste(problematic_local, collapse = ", "), "\n")
+}
+cat("  • Collinear pairs:", 
+    ifelse(!is.null(collinearity_local$collinear_pairs), 
+           nrow(collinearity_local$collinear_pairs), 0), "\n\n")
+
+cat("CITYWIDE SAMPLE:\n")
+cat("  • Complete observations:", nrow(clean_broaddata_complete), "\n")
+cat("  • Significant predictors of Small GSI:", 
+    sum(assoc_city_small$significant, na.rm = TRUE), "\n")
+cat("  • Significant predictors of Mid GSI:", 
+    sum(assoc_city_mid$significant, na.rm = TRUE), "\n")
+cat("  • Significant predictors of Large GSI:", 
+    sum(assoc_city_large$significant, na.rm = TRUE), "\n")
+cat("  • Variables with contingency issues:", 
+    length(problematic_city), "\n")
+if (length(problematic_city) > 0) {
+  cat("    -", paste(problematic_city, collapse = ", "), "\n")
+}
+cat("  • Collinear pairs:", 
+    ifelse(!is.null(collinearity_city$collinear_pairs), 
+           nrow(collinearity_city$collinear_pairs), 0), "\n\n")
+
+# ============================================================================
+# IDENTIFY STRONG ASSOCIATIONS
+# ============================================================================
+
+cat("=== STRONG ASSOCIATIONS (Cramér's V ≥ 0.5 or p < 0.001) ===\n\n")
+
+# Localized
+strong_assoc_local <- bind_rows(
+  assoc_local_small %>% mutate(Outcome = "Small GSI"),
+  assoc_local_mid %>% mutate(Outcome = "Mid GSI"),
+  assoc_local_large %>% mutate(Outcome = "Large GSI")
+) %>%
+  filter((CramersV >= 0.5 | pvalue < 0.001) & significant) %>%
+  arrange(desc(CramersV))
+
+if (nrow(strong_assoc_local) > 0) {
+  cat("LOCALIZED SAMPLE:\n")
+  print(strong_assoc_local %>% 
+        dplyr::select(Outcome, predictor, CramersV, effect_size, pvalue))
+  cat("\n")
+} else {
+  cat("LOCALIZED SAMPLE: No strong associations found\n\n")
+}
+
+# Citywide
+strong_assoc_city <- bind_rows(
+  assoc_city_small %>% mutate(Outcome = "Small GSI"),
+  assoc_city_mid %>% mutate(Outcome = "Mid GSI"),
+  assoc_city_large %>% mutate(Outcome = "Large GSI")
+) %>%
+  filter((CramersV >= 0.5 | pvalue < 0.001) & significant) %>%
+  arrange(desc(CramersV))
+
+if (nrow(strong_assoc_city) > 0) {
+  cat("CITYWIDE SAMPLE:\n")
+  print(strong_assoc_city %>% 
+        dplyr::select(Outcome, predictor, CramersV, effect_size, pvalue))
+  cat("\n")
+} else {
+  cat("CITYWIDE SAMPLE: No strong associations found\n\n")
+}
+
+cat("=== DIAGNOSTIC TESTING COMPLETE ===\n")
+```
+
+## Bayesian Regression Models
+
+Localized sample
+```{r}
+# Priors
+priors_main <- c(
+  set_prior("normal(0, 1)", class = "b"),
+  set_prior("student_t(3, 0, 2.5)", class = "Intercept")
+)
+
+# Small-scale GSI (main effects)
+small_fit_main_numeric <- brm(
+  Prefers_small_GSI ~ Flood_Numeric + Trust_Numeric + 
+    Q29 + Q31_Ordered + Q33_Ordered + Q34,
+  data = cleandata_complete,
+  family = bernoulli(),
+  prior = priors_main,
+  chains = 4, cores = 4, iter = 4000, seed = 789
+)
+
+# Mid-scale GSI (main effects)
+mid_fit_main_numeric <- brm(
+  Prefers_mid_GSI ~ Flood_Numeric + Trust_Numeric + 
+    Q29 + Q31_Ordered + Q33_Ordered + Q34,
+  data = cleandata_complete,
+  family = bernoulli(),
+  prior = priors_main,
+  chains = 4, cores = 4, iter = 4000, seed = 790
+)
+
+# Large-scale GSI (main effects)
+large_fit_main_numeric <- brm(
+  Prefers_large_GSI ~ Flood_Numeric + Trust_Numeric + 
+    Q29 + Q31_Ordered + Q33_Ordered + Q34,
+  data = cleandata_complete,
+  family = bernoulli(),
+  prior = priors_main,
+  chains = 4, cores = 4, iter = 4000, seed = 791
+)
+
+# Models with interaction
+small_fit_interaction <- brm(
+  Prefers_small_GSI ~ Flood_Numeric * Trust_Numeric + 
+    Q29 + Q31_Ordered + Q33_Ordered + Q34,
+  data = cleandata_complete,
+  family = bernoulli(),
+  prior = priors_main,
+  chains = 4, cores = 4, iter = 4000, seed = 789
+)
+
+mid_fit_interaction <- brm(
+  Prefers_mid_GSI ~ Flood_Numeric * Trust_Numeric + 
+    Q29 + Q31_Ordered + Q33_Ordered + Q34,
+  data = cleandata_complete,
+  family = bernoulli(),
+  prior = priors_main,
+  chains = 4, cores = 4, iter = 4000, seed = 790
+)
+
+large_fit_interaction <- brm(
+  Prefers_large_GSI ~ Flood_Numeric * Trust_Numeric + 
+    Q29 + Q31_Ordered + Q33_Ordered + Q34,
+  data = cleandata_complete,
+  family = bernoulli(),
+  prior = priors_main,
+  chains = 4, cores = 4, iter = 4000, seed = 791
+)
+```
+
+Citywide sample
+```{r}
+# Small-scale GSI (main effects)
+small_fit_main_numeric_b <- brm(
+  Prefers_small_GSI ~ Flood_Numeric + Trust_Numeric + 
+    Q29 + Q31_Ordered + Q33_Ordered + Q34,
+  data = clean_broaddata_complete,
+  family = bernoulli(),
+  prior = priors_main,
+  chains = 4, cores = 4, iter = 4000, seed = 789
+)
+
+# Mid-scale GSI (main effects)
+mid_fit_main_numeric_b <- brm(
+  Prefers_mid_GSI ~ Flood_Numeric + Trust_Numeric + 
+    Q29 + Q31_Ordered + Q33_Ordered + Q34,
+  data = clean_broaddata_complete,
+  family = bernoulli(),
+  prior = priors_main,
+  chains = 4, cores = 4, iter = 4000, seed = 790
+)
+
+# Large-scale GSI (main effects)
+large_fit_main_numeric_b <- brm(
+  Prefers_large_GSI ~ Flood_Numeric + Trust_Numeric + 
+    Q29 + Q31_Ordered + Q33_Ordered + Q34,
+  data = clean_broaddata_complete,
+  family = bernoulli(),
+  prior = priors_main,
+  chains = 4, cores = 4, iter = 4000, seed = 791
+)
+
+# Models with interaction
+small_fit_interaction_b <- brm(
+  Prefers_small_GSI ~ Flood_Numeric * Trust_Numeric + 
+    Q29 + Q31_Ordered + Q33_Ordered + Q34,
+  data = clean_broaddata_complete,
+  family = bernoulli(),
+  prior = priors_main,
+  chains = 4, cores = 4, iter = 4000, seed = 789
+)
+
+mid_fit_interaction_b <- brm(
+  Prefers_mid_GSI ~ Flood_Numeric * Trust_Numeric + 
+    Q29 + Q31_Ordered + Q33_Ordered + Q34,
+  data = clean_broaddata_complete,
+  family = bernoulli(),
+  prior = priors_main,
+  chains = 4, cores = 4, iter = 4000, seed = 790
+)
+
+large_fit_interaction_b <- brm(
+  Prefers_large_GSI ~ Flood_Numeric * Trust_Numeric + 
+    Q29 + Q31_Ordered + Q33_Ordered + Q34,
+  data = clean_broaddata_complete,
+  family = bernoulli(),
+  prior = priors_main,
+  chains = 4, cores = 4, iter = 4000, seed = 791
+)
+```
+
+## Model diagnostics (for both samples)
+```{r}
+# 4. Model Diagnostics
+
+## 4.1 Convergence Checks
+
+```{r convergence-checks}
+# Function to check convergence
+check_convergence <- function(model, model_name) {
+  cat("\n=== Convergence Check:", model_name, "===\n")
+  
+  # R-hat statistics
+  rhats <- rhat(model)
+  cat("R-hat range:", round(min(rhats), 3), "to", round(max(rhats), 3), "\n")
+  
+  # Effective sample sizes
+  ess_bulk <- neff_ratio(model)
+  cat("Bulk ESS range:", round(min(ess_bulk), 0), "to", round(max(ess_bulk), 0), "\n")
+  
+  # Check for warnings
+  if (any(rhats > 1.01)) {
+    cat("WARNING: Some R-hat values > 1.01\n")
+  } else {
+    cat("✓ All R-hat values < 1.01\n")
+  }
+  
+  if (any(ess_bulk < 0.1)) {
+    cat("WARNING: Some ESS ratios < 0.1\n")
+  } else {
+    cat("✓ All ESS ratios > 0.1\n")
+  }
+}
+
+# Check all localized models
+check_convergence(small_fit_main_numeric, "Localized - Small GSI")
+check_convergence(mid_fit_main_numeric, "Localized - Mid GSI")
+check_convergence(large_fit_main_numeric, "Localized - Large GSI")
+
+# Check all citywide models
+check_convergence(small_fit_main_numeric_b, "Citywide - Small GSI")
+check_convergence(mid_fit_main_numeric_b, "Citywide - Mid GSI")
+check_convergence(large_fit_main_numeric_b, "Citywide - Large GSI")
+```
+
+# Posterior predictive checks
+```{r}
+# Localized models
+p1 <- pp_check(small_fit_main_numeric, ndraws = 100) + 
+  ggtitle("Localized: Small GSI")
+p2 <- pp_check(mid_fit_main_numeric, ndraws = 100) + 
+  ggtitle("Localized: Mid GSI")
+p3 <- pp_check(large_fit_main_numeric, ndraws = 100) + 
+  ggtitle("Localized: Large GSI")
+
+# Citywide models
+p4 <- pp_check(small_fit_main_numeric_b, ndraws = 100) + 
+  ggtitle("Citywide: Small GSI")
+p5 <- pp_check(mid_fit_main_numeric_b, ndraws = 100) + 
+  ggtitle("Citywide: Mid GSI")
+p6 <- pp_check(large_fit_main_numeric_b, ndraws = 100) + 
+  ggtitle("Citywide: Large GSI")
+
+(p1 | p2 | p3) / (p4 | p5 | p6)
+```
+
+# Model comparison: Leave-one-out cross-validation
+
+```{r}
+cat("\n=== Model Comparisons: Localized Data ===\n")
+
+cat("\nSmall GSI:\n")
+loo_small <- loo_compare(loo(small_fit_interaction), loo(small_fit_main_numeric))
+print(loo_small)
+
+cat("\nMid GSI:\n")
+loo_mid <- loo_compare(loo(mid_fit_interaction), loo(mid_fit_main_numeric))
+print(loo_mid)
+
+cat("\nLarge GSI:\n")
+loo_large <- loo_compare(loo(large_fit_interaction), loo(large_fit_main_numeric))
+print(loo_large)
+
+cat("\n=== Model Comparisons: Citywide Data ===\n")
+
+cat("\nSmall GSI:\n")
+loo_small_b <- loo_compare(loo(small_fit_interaction_b), loo(small_fit_main_numeric_b))
+print(loo_small_b)
+
+cat("\nMid GSI:\n")
+loo_mid_b <- loo_compare(loo(mid_fit_interaction_b), loo(mid_fit_main_numeric_b))
+print(loo_mid_b)
+
+cat("\nLarge GSI:\n")
+loo_large_b <- loo_compare(loo(large_fit_interaction_b), loo(large_fit_main_numeric_b))
+print(loo_large_b)
+```
+
+# Testing alternative pathways analysis
+
+```{r}
+## Flood --> Trust
+
+# Citywide sample only
+trust_model_citywide <- brm(
+  Trust_Numeric ~ Flood_Numeric + Q29 + Q31_Ordered + Q33_Ordered + Q34,
+  data = cleandata_complete,
+  family = gaussian(),
+  prior = c(
+    set_prior("normal(0, 1)", class = "b"),
+    set_prior("normal(3, 2)", class = "Intercept"),
+    set_prior("exponential(1)", class = "sigma")
+  ),
+  chains = 4, cores = 4, iter = 4000, seed = 999
+)
+
+cat("\n=== Path a: Flood → Trust ===\n")
+print(summary(trust_model_citywide)$fixed["Flood_Numeric", ])
+
+# Extract posterior samples
+post_trust <- as_draws_df(trust_model_citywide)
+post_small <- as_draws_df(small_fit_main_numeric_b)
+post_mid <- as_draws_df(mid_fit_main_numeric_b)
+post_large <- as_draws_df(large_fit_main_numeric_b)
+
+# Path a: Flood → Trust
+path_a <- post_trust$b_Flood_Numeric
+
+# Path b: Trust → GSI (for each outcome)
+path_b_small <- post_small$b_Trust_Numeric
+path_b_mid <- post_mid$b_Trust_Numeric
+path_b_large <- post_large$b_Trust_Numeric
+
+# Indirect effects = a × b
+indirect_small <- path_a * path_b_small
+indirect_mid <- path_a * path_b_mid
+indirect_large <- path_a * path_b_large
+
+# Direct effects (c')
+direct_small <- post_small$b_Flood_Numeric
+direct_mid <- post_mid$b_Flood_Numeric
+direct_large <- post_large$b_Flood_Numeric
+
+# Total effects (c = c' + ab)
+total_small <- direct_small + indirect_small
+total_mid <- direct_mid + indirect_mid
+total_large <- direct_large + indirect_large
+
+# Summarize
+summarize_posterior <- function(samples, name) {
+  data.frame(
+    Effect = name,
+    Estimate = mean(samples),
+    Est.Error = sd(samples),
+    Q2.5 = quantile(samples, 0.025),
+    Q97.5 = quantile(samples, 0.975),
+    Prob_Positive = mean(samples > 0)
+  )
+}
+
+mediation_results <- bind_rows(
+  summarize_posterior(path_a, "Path a: Flood → Trust"),
+  summarize_posterior(path_b_small, "Path b (Small): Trust → GSI"),
+  summarize_posterior(direct_small, "Direct (Small): Flood → GSI"),
+  summarize_posterior(indirect_small, "Indirect (Small): Flood → Trust → GSI"),
+  summarize_posterior(total_small, "Total (Small): Flood → GSI"),
+  summarize_posterior(path_b_mid, "Path b (Mid): Trust → GSI"),
+  summarize_posterior(direct_mid, "Direct (Mid): Flood → GSI"),
+  summarize_posterior(indirect_mid, "Indirect (Mid): Flood → Trust → GSI"),
+  summarize_posterior(total_mid, "Total (Mid): Flood → GSI"),
+  summarize_posterior(path_b_large, "Path b (Large): Trust → GSI"),
+  summarize_posterior(direct_large, "Direct (Large): Flood → GSI"),
+  summarize_posterior(indirect_large, "Indirect (Large): Flood → Trust → GSI"),
+  summarize_posterior(total_large, "Total (Large): Flood → GSI")
+) %>%
+  mutate(across(where(is.numeric), ~round(., 3)))
+
+print(mediation_results)
+
+# Restructure for plotting
+all_paths <- mediation_results %>%
+  filter(!grepl("Path a", Effect)) %>%
+  mutate(
+    GSI_Scale = case_when(
+      grepl("Small", Effect) ~ "Small-Scale GSI",
+      grepl("Mid", Effect) ~ "Mid-Scale GSI",
+      grepl("Large", Effect) ~ "Large-Scale GSI"
+    ),
+    Path_Type = case_when(
+      grepl("Path b", Effect) ~ "Path b: Trust → GSI",
+      grepl("Direct", Effect) ~ "Direct: Flood → GSI",
+      grepl("Indirect", Effect) ~ "Indirect: Flood → Trust → GSI",
+      grepl("Total", Effect) ~ "Total Effect"
+    )
+  ) %>%
+  filter(!is.na(GSI_Scale))
+
+# Create visualization
+ggplot(all_paths, aes(x = Path_Type, y = Estimate, color = GSI_Scale)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_point(size = 3, position = position_dodge(width = 0.5)) +
+  geom_errorbar(aes(ymin = Q2.5, ymax = Q97.5), 
+                width = 0.3, linewidth = 0.8,
+                position = position_dodge(width = 0.5)) +
+  coord_flip() +
+  labs(
+    title = "Mediation Analysis: Flood → Trust → GSI Preference",
+    subtitle = "Comparison of mediation pathways across GSI scales",
+    x = NULL,
+    y = "Effect Estimate (95% Credible Interval)",
+    color = "GSI Scale"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 11),
+    legend.position = "bottom"
+  ) +
+  scale_color_manual(values = c("#E69F00", "#56B4E9", "#009E73"))
+```
+
+# Marginal effects analysis
+
+```{r}
+# Function to extract marginal effects
+extract_marginal_effects <- function(model, scale_name, sample_name) {
+  me <- avg_slopes(model, type = "response")
+  me_df <- as.data.frame(me) %>%
+    mutate(Scale = scale_name, Sample = sample_name)
+  return(me_df)
+}
+
+# Extract for all models
+me_local_small <- extract_marginal_effects(small_fit_main_numeric, "Small", "Localized")
+me_local_mid <- extract_marginal_effects(mid_fit_main_numeric, "Mid", "Localized")
+me_local_large <- extract_marginal_effects(large_fit_main_numeric, "Large", "Localized")
+
+me_city_small <- extract_marginal_effects(small_fit_main_numeric_b, "Small", "Citywide")
+me_city_mid <- extract_marginal_effects(mid_fit_main_numeric_b, "Mid", "Citywide")
+me_city_large <- extract_marginal_effects(large_fit_main_numeric_b, "Large", "Citywide")
+
+# Combine
+me_all <- bind_rows(
+  me_local_small, me_local_mid, me_local_large,
+  me_city_small, me_city_mid, me_city_large
+)
+```
+
+```{r}
+# Create readable predictor names
+me_plot_data <- me_all %>%
+  mutate(
+    Predictor = case_when(
+      term == "Flood_Numeric" ~ "Flood Frequency",
+      term == "Trust_Numeric" ~ "Trust",
+      grepl("Yes - No", contrast) ~ "Hispanic/Latinx",
+      grepl("I own my home", contrast) ~ "Homeowner",
+      grepl("I rent my home", contrast) ~ "Renter",
+      grepl("Moderate.*50k", contrast) ~ "Income: Moderate",
+      grepl("High.*150k|High.*≥150k", contrast) ~ "Income: High",
+      grepl("6-10 years", contrast) ~ "Residence: 6-10 years",
+      grepl("11-20 years", contrast) ~ "Residence: 11-20 years",
+      grepl("Over 20 years", contrast) ~ "Residence: Over 20 years",
+      TRUE ~ paste(term, contrast)
+    ),
+    Category = case_when(
+      Predictor %in% c("Flood Frequency", "Trust") ~ "Risk/Trust",
+      Predictor == "Hispanic/Latinx" ~ "Ethnicity",
+      Predictor %in% c("Homeowner", "Renter") ~ "Housing Tenure",
+      grepl("Income:", Predictor) ~ "Income",
+      grepl("Residence:", Predictor) ~ "Residence",
+      TRUE ~ "Other"
+    )
+  )
+
+# Add reference categories
+reference_data <- expand.grid(
+  Predictor = c("Other Housing (ref)", "Non-Hispanic (ref)", 
+                "Income: Low (ref)", "Residence: ≤5 years (ref)"),
+  Scale = c("Small", "Mid", "Large"),
+  Sample = c("Localized", "Citywide"),
+  stringsAsFactors = FALSE
+) %>%
+  mutate(
+    estimate = 0, conf.low = 0, conf.high = 0,
+    Category = case_when(
+      grepl("Housing", Predictor) ~ "Housing Tenure",
+      grepl("Hispanic", Predictor) ~ "Ethnicity",
+      grepl("Income", Predictor) ~ "Income",
+      grepl("Residence", Predictor) ~ "Residence"
+    ),
+    Reference = "Yes"
+  )
+
+me_plot_data_full <- me_plot_data %>%
+  mutate(Reference = "No") %>%
+  bind_rows(reference_data) %>%
+  mutate(
+    Predictor = factor(Predictor, levels = c(
+      "Flood Frequency", "Trust",
+      "Non-Hispanic (ref)", "Hispanic/Latinx",
+      "Other Housing (ref)", "Homeowner", "Renter",
+      "Income: Low (ref)", "Income: Moderate", "Income: High",
+      "Residence: ≤5 years (ref)", "Residence: 6-10 years", 
+      "Residence: 11-20 years", "Residence: Over 20 years"
+    ))
+  )
+
+# Function to create panel plots
+create_me_panel_plot <- function(data, sample_name) {
+  plot_data <- data %>% filter(Sample == sample_name)
+  
+  # Structural predictors panel
+  structural_data <- plot_data %>%
+    filter(Category %in% c("Housing Tenure", "Ethnicity", "Income", "Residence"))
+  
+  p_structural <- ggplot(structural_data, 
+                        aes(x = estimate, y = Predictor, color = Scale, alpha = Reference)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray50", linewidth = 0.8) +
+    geom_point(size = 3, position = position_dodge(width = 0.6)) +
+    geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), 
+                   height = 0.2, linewidth = 0.9,
+                   position = position_dodge(width = 0.6)) +
+    labs(
+      title = paste0(sample_name, " Sample: Structural Predictors"),
+      x = "Marginal Effect (Δ Probability)",
+      y = NULL,
+      color = "GSI Scale"
+    ) +
+    theme_minimal(base_size = 10) +
+    theme(
+      plot.title = element_text(face = "bold", size = 11),
+      legend.position = "none",
+      panel.grid.minor = element_blank(),
+      axis.text.y = element_text(size = 9)
+    ) +
+    scale_color_manual(
+      values = c("Small" = "#C8DEA9", "Mid" = "#607F34", "Large" = "#274200")
+    ) +
+    scale_alpha_manual(
+      values = c("No" = 1, "Yes" = 0.4),
+      guide = "none"
+    ) +
+    scale_x_continuous(labels = scales::percent_format(accuracy = 1))
+  
+  # Experiential predictors panel
+  experiential_data <- plot_data %>%
+    filter(Category == "Risk/Trust")
+  
+  p_experiential <- ggplot(experiential_data, 
+                          aes(x = estimate, y = Predictor, color = Scale)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray50", linewidth = 0.8) +
+    geom_point(size = 3, position = position_dodge(width = 0.6)) +
+    geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), 
+                   height = 0.2, linewidth = 0.9,
+                   position = position_dodge(width = 0.6)) +
+    labs(
+      title = paste0(sample_name, " Sample: Experiential Predictors"),
+      x = "Marginal Effect (Δ Probability)",
+      y = NULL,
+      color = "GSI Scale"
+    ) +
+    theme_minimal(base_size = 10) +
+    theme(
+      plot.title = element_text(face = "bold", size = 11),
+      legend.position = "none",
+      panel.grid.minor = element_blank()
+    ) +
+    scale_color_manual(
+      values = c("Small" = "#C8DEA9", "Mid" = "#607F34", "Large" = "#274200")
+    ) +
+    scale_x_continuous(labels = scales::percent_format(accuracy = 1))
+  
+  return(list(structural = p_structural, experiential = p_experiential))
+}
+
+# Create panels WITHOUT legend
+panels_local <- create_me_panel_plot(me_plot_data_full, "Localized")
+panels_city <- create_me_panel_plot(me_plot_data_full, "Citywide")
+
+# Create the plot layout first
+p_combined <- (panels_local$$structural | panels_city$$structural) /
+              (panels_local$$experiential | panels_city$$experiential) +
+  plot_layout(heights = c(3, 1))
+
+# Create a dummy plot with legend
+dummy_plot <- ggplot(me_plot_data_full %>% filter(Category == "Risk/Trust"), 
+                     aes(x = estimate, y = Predictor, color = Scale)) +
+  geom_point() +
+  scale_color_manual(
+    values = c("Small" = "#C8DEA9", "Mid" = "#607F34", "Large" = "#274200"),
+    labels = c("Small-Scale", "Mid-Scale", "Large-Scale"),
+    name = "GSI Scale"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    legend.direction = "horizontal"
+  ) +
+  guides(color = guide_legend(nrow = 1))
+
+# Extract the legend
+legend <- get_legend(dummy_plot)
+
+# Combine plot with legend at bottom center
+p_with_legend <- plot_grid(
+  p_combined,
+  legend,
+  ncol = 1,
+  rel_heights = c(1, 0.05)
+)
+
+# Add title and subtitle
+p_final_me <- wrap_elements(p_with_legend) +
+  plot_annotation(
+    title = "Marginal Effects of Predictors on GSI Preferences: Localized vs. Citywide Samples",
+    subtitle = "Effects shown as percentage point changes in predicted probability of GSI support"
+  ) &
+  theme(
+    plot.title = element_text(size = 15, face = "bold"),
+    plot.subtitle = element_text(size = 11, color = "gray30")
+  )
+
+# Display
+print(p_final_me)
+
+# Save
+ggsave("Figure4_Marginal_Effects.png", p_final_me, 
+       width = 14, height = 12, dpi = 300, bg = "white")
+ggsave("Figure4_Marginal_Effects.svg", p_final_me, 
+       width = 14, height = 12)
+
+cat("\n✓ Figure 4 saved as:\n")
+cat("  - Figure4_Marginal_Effects.png\n")
+cat("  - Figure4_Marginal_Effects.svg\n")
+```
+
+
+
+
+
+
